@@ -239,6 +239,20 @@ json.dump(rows, sys.stdout, ensure_ascii=False, default=str)",
         let now_ms = current_time_ms();
         let mut sessions = Vec::new();
 
+        // Collect active session IDs for chat data query
+        let active_sids: Vec<String> = self
+            .cached_db_sessions
+            .iter()
+            .filter(|ds| pid_map.values().any(|sid| sid.as_str() == ds.id))
+            .map(|ds| ds.id.clone())
+            .collect();
+        // Only fetch chat data on slow ticks (expensive)
+        let chat_data = if shared.slow_tick {
+            query_chat_data(&self.db_path, &active_sids)
+        } else {
+            HashMap::new()
+        };
+
         // Build a set of tracked session_ids for cache eviction later
         let _db_ids: HashSet<&str> = self
             .cached_db_sessions
@@ -405,10 +419,23 @@ json.dump(rows, sys.stdout, ensure_ascii=False, default=str)",
                 mem_file_count: 0,
                 mem_line_count: 0,
                 children,
-                initial_prompt: ds.title.clone(),
-                first_assistant_text: String::new(),
-                chat_messages: vec![],
-                tool_calls: vec![],
+                initial_prompt: chat_data
+                    .get(&ds.id)
+                    .map(|d| d.0.clone())
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or_else(|| ds.title.clone()),
+                first_assistant_text: chat_data
+                    .get(&ds.id)
+                    .map(|d| d.1.clone())
+                    .unwrap_or_default(),
+                chat_messages: chat_data
+                    .get(&ds.id)
+                    .map(|d| d.2.clone())
+                    .unwrap_or_default(),
+                tool_calls: chat_data
+                    .get(&ds.id)
+                    .map(|d| d.3.clone())
+                    .unwrap_or_default(),
                 pending_since_ms: 0,
                 thinking_since_ms,
                 file_accesses: vec![],
@@ -647,6 +674,166 @@ impl Default for HermesCollector {
 impl super::AgentCollector for HermesCollector {
     fn collect(&mut self, shared: &super::SharedProcessData) -> Vec<AgentSession> {
         self.collect_sessions(shared)
+    }
+}
+
+/// Batch-query chat messages and tool calls for active sessions.
+fn query_chat_data(
+    db_path: &std::path::Path,
+    session_ids: &[String],
+) -> HashMap<String, (String, String, Vec<crate::model::ChatMessage>, Vec<crate::model::ToolCall>)> {
+    use crate::model::{ChatMessage, ChatRole, ToolCall};
+    use crate::model::MAX_CHAT_MESSAGES;
+    if session_ids.is_empty() || !db_path.exists() {
+        return HashMap::new();
+    }
+
+    let db_str = db_path.to_str().unwrap_or("").replace('\\', "/");
+    let ids_json = serde_json::to_string(session_ids).unwrap_or_else(|_| "[]".to_string());
+    let ids_py = ids_json.replace('\'', "'\\''");
+
+    let script = format!(
+        r#"import sqlite3, json, sys
+ids = json.loads(r'{}')
+db = r'{}'
+placeholders = ','.join(['?'] * len(ids))
+query = """SELECT m.session_id, m.role, m.content, m.tool_calls,
+       CAST(CAST(m.timestamp AS REAL) * 1000 AS INTEGER) as ts_ms
+FROM messages m
+WHERE m.session_id IN ({})
+ORDER BY m.id ASC"""
+conn = sqlite3.connect(db)
+conn.row_factory = sqlite3.Row
+cur = conn.execute(query, ids)
+rows = [dict(row) for row in cur.fetchall()]
+conn.close()
+json.dump(rows, sys.stdout, ensure_ascii=False, default=str)
+"#,
+        ids_py,
+        db_str,
+        placeholders_str(session_ids.len()),
+    );
+
+    let output = std::process::Command::new("python")
+        .args(["-c", &script])
+        .output()
+        .ok();
+    let output = match output {
+        Some(o) if o.status.success() => o,
+        _ => return HashMap::new(),
+    };
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    if stdout.trim().is_empty() {
+        return HashMap::new();
+    }
+
+    let rows: Vec<serde_json::Value> = match serde_json::from_str(stdout.trim()) {
+        Ok(r) => r,
+        Err(_) => return HashMap::new(),
+    };
+
+    let mut result: HashMap<String, (String, String, Vec<ChatMessage>, Vec<ToolCall>)> =
+        HashMap::new();
+
+    for row in &rows {
+        let sid = match row["session_id"].as_str() {
+            Some(s) => s.to_string(),
+            None => continue,
+        };
+        let role = row["role"].as_str().unwrap_or("");
+        let content = row["content"].as_str().unwrap_or("").to_string();
+
+        let entry = result.entry(sid).or_insert_with(|| {
+            (
+                String::new(), // initial_prompt
+                String::new(), // first_assistant_text
+                Vec::new(),    // chat_messages
+                Vec::new(),    // tool_calls
+            )
+        });
+
+        match role {
+            "user" => {
+                if entry.0.is_empty() && !content.is_empty() {
+                    entry.0 = content.clone();
+                }
+                if !content.is_empty() {
+                    entry.2.push(ChatMessage {
+                        role: ChatRole::User,
+                        text: super::redact_secrets(&content),
+                    });
+                }
+            }
+            "assistant" => {
+                if entry.1.is_empty() && !content.is_empty() {
+                    entry.1 = content.clone();
+                }
+                // Extract tool calls from JSON tool_calls column
+                if let Some(tc_val) = row["tool_calls"].as_str() {
+                    if let Ok(tcs) = serde_json::from_str::<Vec<serde_json::Value>>(tc_val) {
+                        for tc in &tcs {
+                            if let Some(name) = tc["function"]["name"].as_str() {
+                                let arg = tc["function"]["arguments"]
+                                    .as_str()
+                                    .unwrap_or("")
+                                    .to_string();
+                                entry.3.push(ToolCall {
+                                    name: name.to_string(),
+                                    arg: truncate_arg(&arg),
+                                    duration_ms: 0,
+                                });
+                            }
+                        }
+                    }
+                }
+                if !content.is_empty() {
+                    entry.2.push(ChatMessage {
+                        role: ChatRole::Assistant,
+                        text: super::redact_secrets(&content),
+                    });
+                }
+            }
+            _ => {} // skip tool role messages
+        }
+    }
+
+    // Trim chat_messages to MAX_CHAT_MESSAGES
+    for entry in result.values_mut() {
+        if entry.2.len() > MAX_CHAT_MESSAGES {
+            let start = entry.2.len() - MAX_CHAT_MESSAGES;
+            let tail = entry.2.drain(start..).collect();
+            entry.2 = tail;
+        }
+    }
+
+    result
+}
+
+/// Build a placeholder string for SQL IN clause.
+fn placeholders_str(count: usize) -> String {
+    let mut s = String::with_capacity(count * 2);
+    for i in 0..count {
+        if i > 0 {
+            s.push(',');
+        }
+        s.push('?');
+        s.push_str(&(i + 1).to_string());
+    }
+    s
+}
+
+/// Truncate a tool call argument for display.
+fn truncate_arg(arg: &str) -> String {
+    if arg.len() > 80 {
+        // Find last char boundary at or before 77
+        let mut end = 77;
+        while end > 0 && !arg.is_char_boundary(end) {
+            end -= 1;
+        }
+        format!("{}...", &arg[..end])
+    } else {
+        arg.to_string()
     }
 }
 
