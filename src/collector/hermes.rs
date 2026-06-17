@@ -198,12 +198,13 @@ conn.row_factory = sqlite3.Row
 cur = conn.execute(query)
 rows = [dict(row) for row in cur.fetchall()]
 conn.close()
-json.dump(rows, sys.stdout, ensure_ascii=False, default=str)",
+sys.stdout.buffer.write(json.dumps(rows, ensure_ascii=False, default=str).encode('utf-8'))",
             sql_path.replace('\\', "/"),
             db.replace('\\', "/"),
         );
 
         let output = Command::new("python")
+            .env("PYTHONIOENCODING", "utf-8")
             .args(["-c", &script])
             .output()
             .ok()?;
@@ -707,7 +708,7 @@ conn.row_factory = sqlite3.Row
 cur = conn.execute(query, ids)
 rows = [dict(row) for row in cur.fetchall()]
 conn.close()
-json.dump(rows, sys.stdout, ensure_ascii=False, default=str)
+sys.stdout.buffer.write(json.dumps(rows, ensure_ascii=False, default=str).encode('utf-8'))
 "#,
         ids_py,
         db_str,
@@ -715,6 +716,7 @@ json.dump(rows, sys.stdout, ensure_ascii=False, default=str)
     );
 
     let output = std::process::Command::new("python")
+        .env("PYTHONIOENCODING", "utf-8")
         .args(["-c", &script])
         .output()
         .ok();
